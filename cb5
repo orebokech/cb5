@@ -1,0 +1,199 @@
+#!/usr/bin/python
+
+# cb5 -- the ConveyorBelt blog engine, version 5
+#
+# Copyright (C) 2010, 2012 Romain Francoise <romain@orebokech.com>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# TODO:
+# - titles probably must be ascii
+# - hardcoded stuff like archive page names, date formats
+# - relative/absolute post links are messy
+
+import datetime
+import os
+import sys
+
+from ConfigParser import ConfigParser
+from cStringIO import StringIO
+
+import markdown
+import PyRSS2Gen
+from mako.template import Template
+
+CONFIG_FILE = 'cb5.conf'
+
+class Post(object):
+
+    def __init__(self, filename, mtime):
+        self.filename = filename
+        self.mtime = mtime
+        self.title = open(filename, 'r').readline().strip('# \n')
+        self.html = None
+
+    def rel_url(self, datadir):
+        # datadir/2010/08/foo.mdwn -> 2010/08/foo.html
+        return self.filename.replace('mdwn', 'html').replace(datadir, '')
+
+    def get_mtime(self):
+        return self.mtime
+
+    def gen_markup(self):
+        if not self.html:
+            out = StringIO()
+            mdwn = markdown.Markdown()
+            mdwn.convertFile(input=self.filename, output=out)
+            self.html = out.getvalue()
+        return self.html
+
+class Cb5(object):
+
+    def __init__(self, config_file):
+        self.posts = []
+        config = ConfigParser()
+        config.read(config_file)
+        self.baseurl = config.get('main', 'baseurl')
+        self.datadir = config.get('main', 'datadir')
+        self.htdocs = config.get('main', 'htdocs')
+        self.template = config.get('main', 'template')
+        self.rss_title = config.get('rss', 'title')
+        self.rss_link = config.get('rss', 'link')
+        self.rss_description = config.get('rss', 'description')
+        self.rss_maxitems = int(config.get('rss', 'maxitems'))
+
+    def load_posts(self):
+        for dirpath, _, files in os.walk(self.datadir):
+            for fname in [_ for _ in files if _.endswith('.mdwn')]:
+                path = os.path.join(dirpath, fname)
+                post = Post(path, os.path.getmtime(path))
+                post.gen_markup()
+                self.posts.append(post)
+        self.posts.sort(key=Post.get_mtime)
+
+    def gen_rss(self):
+        rss_items = []
+        for post in self.posts[::-1][:self.rss_maxitems]:
+            # strip title (h1 on first line)
+            html = '\n'.join(post.html.split('\n')[1:])
+            link = self.baseurl + post.rel_url(self.datadir)
+            pubdate = datetime.datetime.utcfromtimestamp(post.mtime)
+            rss_items.append(PyRSS2Gen.RSSItem(title=post.title,
+                                               link=link,
+                                               description=html,
+                                               guid=PyRSS2Gen.Guid(link),
+                                               pubDate=pubdate))
+        rss = PyRSS2Gen.RSS2(title=self.rss_title,
+                             link=self.rss_link,
+                             description=self.rss_description,
+                             lastBuildDate=datetime.datetime.utcnow(),
+                             items=rss_items)
+        rss.generator = 'ConveyorBelt v5'
+        rss.docs = 'http://cyber.law.harvard.edu/rss/rss.html'
+        # required by feedvalidator...
+        rss.rss_attrs['xmlns:atom'] = 'http://www.w3.org/2005/Atom'
+        rss.publish_extensions = \
+            lambda h: PyRSS2Gen._element(h, 'atom:link', None,
+                                         {'href': self.baseurl + 'index.xml',
+                                          'rel': 'self',
+                                          'type': 'application/rss+xml'})
+        rss.write_xml(open(os.path.join(self.htdocs, 'index.xml'), 'w'),
+                      encoding='utf-8')
+
+    def gen_html(self):
+        template = Template(filename=os.path.join(self.datadir,
+                                                  self.template),
+                            input_encoding='utf-8',
+                            output_encoding='utf-8')
+        previous_post = None
+        for post in self.posts:
+            pubdate = datetime.datetime.utcfromtimestamp(post.mtime)
+            template_values = {
+                'page_title': post.title.decode('utf-8'),
+                'page_content': post.html.decode('utf-8'),
+                'page_meta': True,
+                'post_date': pubdate.strftime('%B %d, %Y'),
+                'post_url': post.rel_url(self.datadir),
+                'post_perm': "Permanent link to %s" % post.title,
+                'previous_post': previous_post
+                }
+            if previous_post:
+                prev_post_values = {
+                    'prev_post_url': previous_post.rel_url(self.datadir),
+                    'prev_post_title': previous_post.title
+                    }
+                template_values.update(prev_post_values)
+            output_file = os.path.join(self.htdocs,
+                                       post.rel_url(self.datadir))
+            try:
+                os.makedirs(os.path.dirname(output_file))
+            except OSError:
+                # already existing, permission error will be handled at
+                # write time
+                pass
+            out = open(output_file, 'w')
+            out.write(template.render(**template_values))
+            previous_post = post
+        # index.html is the last post in self.posts
+        index = os.path.join(self.htdocs, 'index.html')
+        if os.path.exists(index):
+            os.unlink(index)
+        os.symlink(self.posts[-1].rel_url(self.datadir), index)
+
+    def gen_archives(self):
+        template = Template(filename=os.path.join(self.datadir,
+                                                  self.template),
+                            input_encoding='utf-8',
+                            output_encoding='utf-8')
+        html = '<h1>Archives</h1>\n'
+        current_year = ''
+        for post in reversed(self.posts):
+            pubdate = datetime.datetime.utcfromtimestamp(post.mtime)
+            year = pubdate.strftime('%Y')
+            if year != current_year:
+                if current_year:
+                    html += '</p>\n'
+                html += '<h2>%s</h2>\n<p>' % year
+                current_year = year
+            date = pubdate.strftime('%b %d')
+            text = '<a href="/%s">%s</a><br />' \
+                % (post.rel_url(self.datadir), post.title)
+            html += '%s: %s\n' % (date, text)
+        html += '</p>\n'
+        out = open(os.path.join(self.htdocs, 'archives.html'), 'w')
+        out.write(template.render(page_title='Archives',
+                                  page_content=html.decode('utf-8'),
+                                  page_meta=False))
+
+    def gen(self):
+        self.load_posts()
+        self.gen_html()
+        self.gen_archives()
+        self.gen_rss()
+
+def main():
+    if os.path.exists(CONFIG_FILE):
+        cb5 = Cb5(CONFIG_FILE)
+        cb5.gen()
+    else:
+        print "E: config file not found in current directory!"
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
